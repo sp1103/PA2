@@ -5,16 +5,23 @@ log = core.getLogger()
 
 class SDNApp(object):
 	def __init__(self, connection):
-		self.connection = conection
+		self.connection = connection
 		connection.addListeners(self)
 		log.debug("Intialized on %s", connection)
 
-	def _handle_packetIn(self, event):
+	def _handle_PacketIn(self, event):
 		packet = event.parsed
 		log.debug("PacketIn: %s", packet)
 
-	def launch():
-		def start_switch(event):
-			log.info("Switch %s has connected", evvent.connection)
-			SDNApp(event.connection)
-		core.openflow.addListenerByName("ConnectionUp", start_switch)
+
+class Set_Up (object):
+	def __init__(self):
+		core.openflow.addListeners(self)
+	
+	def _handle_ConnectionUp(self, event):
+		log.debug("Conection %s", event.connection)
+		SDNApp(event.connection)
+
+def launch():
+	log.info("Starting...")
+	core.registerNew(Set_Up)
