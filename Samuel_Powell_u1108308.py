@@ -1,90 +1,77 @@
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
+from pox.lib.packet.ethernet import ethernet, ETHER_BROADCAST
+from pox.lib.packet.arp import arp
+from pox.lib.packet.vlan import vlan
 from pox.lib.addresses import IPAddr, EthAddr
-
-VIRTUAL_IP = IPAddr("10.0.0.10")
-SERVERS = [
-	{"ip": IPAddr("10.0.0.5"), "mac": EthAddr("00:00:00:00:00:05"), "port": 5},
-	{"ip": IPAddr("10.0.0.6"), "mac": EthAddr("00:00:00:00:00:06"), "port": 5},
-]
-
-server_index = 0
+from pox.lib.util import dpid_to_str, str_to_bool
 
 log = core.getLogger()
 
 class SDNApp(object):
 	def __init__(self, connection):
 		self.connection = connection
+		self.arp_table = {}
 		connection.addListeners(self)
 		log.debug("Intialized on %s", connection)
 
 	def _handle_PacketIn(self, event):
-		global server_index
+		dpid = event.connection.dpid
+		inport = event.port
 		packet = event.parsed
 
-		if not packet:
+		if not packet.parsed:
+			log.warning("%s: ignoring unparsed packet", dpid_to_str(dpid))
 			return
+		
+		a = packet.find('arp')
+		if not a: return
 
-		if packet.type == packet.ARP_TYPE:
-			arp_packet = packet.payload
-			if arp_packet.opcode == arp_packet.REQUEST and arp_packet.protodst == VIRTUAL_IP:
-				chosen_server = SERVERS[server_index]
-				server_index = (server_index + 1) % len(SERVERS)
-
-				log.info("ARP request for %s. Responding with %s", VIRTUAL_IP, chosen_server["ip"])
-
-				arp_reply = of.arp()
-				arp_reply.hwsrc = chosen_server["mac"]
-				arp_reply.protosrc = VIRTUAL_IP
-				arp_reply.hwdst = arp_packet.hwsrc
-				arp_reply.protodst = arp_packet.protosrc
-				arp_reply.opcode = arp_packet.REPLY
-
-				ether_reply = packet
-				ether_reply.type = packet.ARP_TYPE
-				ether_reply.src = chosen_server["mac"]
-				ether_reply.dst = arp_packet.hwsrc
-				ether_reply.payload = arp_reply
-
-				msg = of.ofp_packet_out()
-				msg.data = ether_reply.pack()
-				msg.actions.append(of.ofp_action_output(port=event.port))
-				self.connection.send(msg)
-
+		log.info("%s ARP %s %s => %s", dpid_to_str(dpid),
+                 {arp.REQUEST: "request", arp.REPLY: "reply"}.get(a.opcode, 'unknown'),
+                 a.protosrc, a.protodst)
+		
+		if a.opcode == arp.REQUEST:
+			if a.protodst in self.arp_table:
+				self.send_arp_reply(event, a)
 				return
-		elif packet.type == packet.IP_TYPE:
-			ip_packet = packet.payload
-			if ip_packet.dstip == VIRTUAL_IP:
-				chosen_server = SERVERS[server_index]
-				server_index = (server_index + 1) % len(SERVERS)
+			else: 
+				log.info("Flooding ARP Request")
+				self.flood_packet(event)
+		elif a.opcode == arp.REPLY:
+			self.arp_table[a.protosrc] = a.hwsrc
+			log.info("Learned %s is at %s", a.protosrc, a.hwsrc)
+		
+	def send_arp_reply(self, event, arp_req):
+		mac = self.arp_table[arp_req.protodst]
 
-				log.info("Forwarding %s to %s", VIRTUAL_IP, chosen_server["ip"])
+		r = arp()
+		r.hwtype = arp_req.hwtype
+		r.prototype = arp_req.prototype
+		r.hwlen = arp_req.hwlen
+		r.protolen = arp_req.protolen
+		r.opcode = arp.REPLY
+		r.hwdst = arp_req.hwsrc
+		r.protodst = arp_req.protosrc
+		r.protosrc = arp_req.protodst
+		r.hwsrc = mac
 
-				self.add_flow_rule(client_port=event.port, virtual_ip=VIRTUAL_IP, server=chosen_server)
+		e = ethernet(type=ethernet.ARP_TYPE, src=mac, dst=arp_req.hwsrc)
+		e.payload = r
 
-				self.add_reverse_flow_rule(client_ip=ip_packet.srcip, virtual_ip=VIRTUAL_IP, server=chosen_server)
+		log.info("Sending ARP reply: %s is at %s", r.protosrc, r.hwsrc)
 
-				return
+		msg = of.ofp_packet_out()
+		msg.data = e.pack()
+		msg.actions.append(of.ofp_action_output(port=of.OFPP_IN_PORT))
+		msg.in_port = event.port
+		event.connection.send(msg)
 
-	def add_flow_rule(self, client_port, virtual_ip, server):
-		msg = of.ofp_flow_mod()
-		msg.match.dl_type = 0x0800
-		msg.match.nw_dst = virtual_ip
-		msg.actions.append(of.ofp_action_nw_addr.set_dst(server["ip"]))
-		msg.actions.append(of.ofp_action_output(port=server["port"]))
-		self.connection.send(msg)
-		log.info("Installing flow: client (port %s) -> %s", client_port, server["ip"])
-
-	def add_reverse_flow_rule(self, client_ip, virtual_ip, server):
-		msg = of.ofp_flow_mod()
-		msg.match.dl_type = 0x0800
-		msg.match.nw_src = server["ip"]
-		msg.match.nw_dst = client_ip
-		msg.actions.append(of.ofp_action_nw_addr.set_src(virtual_ip))
-		msg.actions.append(of.ofp_action_output(port=1))
-		self.connection.send(msg)
-		log.info("Installing reverse flow: %s -> client (%s)", server["ip"], client_ip)
-
+	def flood_packet(self, event):
+		msg = of.ofp_packet_out()
+		msg.data = event.pack()
+		msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+		event.connection.send(msg)
 
 class Set_Up (object):
 	def __init__(self):
