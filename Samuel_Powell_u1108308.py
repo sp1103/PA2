@@ -11,7 +11,7 @@ log = core.getLogger()
 class SDNApp(object):
     def __init__(self, connection):
         self.connection = connection
-        self.arp_table = {}  # Store IP -> MAC mappings
+        self.arp_table = {}
         connection.addListeners(self)
         log.debug("Initialized on %s", connection)
 
@@ -26,23 +26,21 @@ class SDNApp(object):
         
         a = packet.find('arp')
         if not a:
-            return  # Not an ARP packet, ignore
+            return
 
         log.info("%s ARP %s %s => %s", dpid_to_str(dpid),
                  {arp.REQUEST: "request", arp.REPLY: "reply"}.get(a.opcode, 'unknown'),
                  a.protosrc, a.protodst)
 
-        if a.opcode == arp.REQUEST:  # If it’s an ARP request
+        if a.opcode == arp.REQUEST:
             if a.protodst in self.arp_table:
-                # If we know the MAC address, send an ARP reply
                 self.send_arp_reply(event, a)
                 return
             else:
                 log.info("Unknown destination, flooding ARP request")
                 self.flood_packet(event)
 
-        elif a.opcode == arp.REPLY:  # If it’s an ARP reply
-            # Learn the MAC address
+        elif a.opcode == arp.REPLY:
             self.arp_table[a.protosrc] = a.hwsrc
             log.info("Learned %s is at %s", a.protosrc, a.hwsrc)
     
@@ -65,15 +63,17 @@ class SDNApp(object):
 
         log.info("Sending ARP reply: %s is at %s", r.protosrc, r.hwsrc)
 
-        msg = of.ofp_packet_out()
+        msg = of.ofp_flow_mod()
         msg.data = e.pack()
+        msg.match = of.ofp_match(dl_type=0x0800)
         msg.actions.append(of.ofp_action_output(port=of.OFPP_IN_PORT))
         msg.in_port = event.port
         event.connection.send(msg)
 
     def flood_packet(self, event):
-        msg = of.ofp_packet_out()
+        msg = of.ofp_flow_mod()
         msg.data = event.ofp
+        msg.match = of.ofp_match(dl_type=0x0800)
         msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
         event.connection.send(msg)
 
@@ -83,11 +83,6 @@ class Set_Up (object):
 	
 	def _handle_ConnectionUp(self, event):
 		log.debug("Conection %s", event.connection)
-		fm = of.ofp_flow_mod()
-		fm.priority -= 0x1000
-		fm.match.dl_type = ethernet.ARP_TYPE
-		fm.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER))
-		event.connection.send(fm)
 		SDNApp(event.connection)
 
 def launch():
