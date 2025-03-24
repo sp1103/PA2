@@ -31,47 +31,55 @@ class SDNApp(object):
                  {arp.REQUEST: "request", arp.REPLY: "reply"}.get(a.opcode, 'unknown'),
                  a.protosrc, a.protodst)
 		
-		if a.opcode == arp.REQUEST:
-			if a.protodst in self.arp_table:
-				self.send_arp_reply(event, a)
-				return
-			else: 
-				log.info("Flooding ARP Request")
-				self.flood_packet(event)
-		elif a.opcode == arp.REPLY:
-			self.arp_table[a.protosrc] = a.hwsrc
-			log.info("Learned %s is at %s", a.protosrc, a.hwsrc)
+		if a.prototype == arp.PROTO_TYPE_ID:
+			if a.hwtype == arp.HW_TYPE_ETHERNET:
+				if a.protosrc != 0:
+
+					if a.opcode == arp.REQUEST:
+						if a.protodst in arp_table:
+							r = arp()
+							r.hwtype = a.hwtype
+							r.prototype = a.prototype
+							r.hwlen = a.hwlen
+							r.protolen = a.protolen
+							r.opcode = arp.REPLY
+							r.hwdst = a.hwsrc
+							r.protodst = a.protosrc
+							r.protosrc = a.protodst
+							mac = arp_table[a.protodst]
+
+							r.hwsrc = mac
+							e = ethernet(type=packet.type, src=event.connection.eth_addr,
+                           					dst=a.hwsrc)
+							e.payload = r
+							if packet.type == ethernet.VLAN_TYPE: 
+								v_rcv = packet.find('vlan')
+								e.payload = vlan(eth_type = e.type,
+                                 					payload = e.payload,
+                                 					id = v_rcv.id,
+                                 					pcp = v_rcv.pcp)
+								e.type = ethernet.VLAN_TYPE
+							log.info("%s answering ARP for %s" % (dpid_to_str(dpid), str(r.protosrc)))
+							msg = of.ofp_packet_out()
+							msg.data = e.pack()
+							msg.actions.append(of.ofp_action_output(port =
+                                                      of.OFPP_IN_PORT))
+							msg.in_port = inport
+							event.connection.send(msg)
+							return
 		
-	def send_arp_reply(self, event, arp_req):
-		mac = self.arp_table[arp_req.protodst]
-
-		r = arp()
-		r.hwtype = arp_req.hwtype
-		r.prototype = arp_req.prototype
-		r.hwlen = arp_req.hwlen
-		r.protolen = arp_req.protolen
-		r.opcode = arp.REPLY
-		r.hwdst = arp_req.hwsrc
-		r.protodst = arp_req.protosrc
-		r.protosrc = arp_req.protodst
-		r.hwsrc = mac
-
-		e = ethernet(type=ethernet.ARP_TYPE, src=mac, dst=arp_req.hwsrc)
-		e.payload = r
-
-		log.info("Sending ARP reply: %s is at %s", r.protosrc, r.hwsrc)
+		msg = "%s flooding ARP %s %s => %s" % (dpid_to_str(dpid),
+          {arp.REQUEST:"request",arp.REPLY:"reply"}.get(a.opcode,
+          'op:%i' % (a.opcode,)), a.protosrc, a.protodst)
+		
+		log.debug(msg)
 
 		msg = of.ofp_packet_out()
-		msg.data = e.pack()
-		msg.actions.append(of.ofp_action_output(port=of.OFPP_IN_PORT))
-		msg.in_port = event.port
-		event.connection.send(msg)
+		msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
+		msg.data = event.ofp
+		event.connection.send(msg.pack())
+		return
 
-	def flood_packet(self, event):
-		msg = of.ofp_packet_out()
-		msg.data = event.pack()
-		msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
-		event.connection.send(msg)
 
 class Set_Up (object):
 	def __init__(self):
@@ -79,6 +87,12 @@ class Set_Up (object):
 	
 	def _handle_ConnectionUp(self, event):
 		log.debug("Conection %s", event.connection)
+		if _install_flow:
+			fm = of.ofp_flow_mod()
+			fm.priority -= 0x1000
+			fm.match.dl_type = ethernet.ARP_TYPE
+			fm.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER))
+			event.connection.send(fm)
 		SDNApp(event.connection)
 
 def launch():
